@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>待办事项</title>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 500px;
+      margin: 20px auto;
+      padding: 20px;
+    }
+    .input-group {
+      padding: 8px;
+      width: 70%;
+      font-size: 16px;
+    }
+    .btn {
+      padding: 8px 12px;
+      font-size: 16px;
+      background: #007bff;
+      color: white;
+      border: none;
+      cursor: pointer;
+      margin: 2px;
+    }
+    .todo-list {
+      list-style: none;
+      padding: 0;
+    }
+    .todo-item {
+      padding: 10px;
+      border: 1px solid #ddd;
+      margin: 5px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+    }
+    .todo-item.completed {
+      background: #f0f0f0;
+      color: #888;
+      text-decoration: line-through;
+      opacity: 0.7;
+    }
+    .delete-btn {
+      background: #dc3545;
+      color: white;
+      border: none;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+    .task-stats {
+      margin: 10px 0;
+      color: #555;
+      font-size: 14px;
+    }
+    .edit-input {
+      padding: 5px;
+      font-size: 14px;
+      width: calc(100% - 60px);
+    }
+    #sync-status {
+      font-size: 12px;
+      color: #888;
+      margin-top: 5px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>待办事项</h1>
+
+  <input type="text" id="new-todo" placeholder="添加待办事项..." class="input-group">
+  <button id="add-todo-btn" class="btn">添加任务</button>
+
+  <ul id="todo-list" class="todo-list"></ul>
+
+  <div class="task-stats">
+    任务数量：<span id="task-count">0</span>
+    <span id="status-message" style="color: red; margin-left: 10px;"></span>
+  </div>
+
+  <div id="sync-status">上次同步：未开始</div>
+
+  <script>
+    // 你的后端接口（laf.run）
+    const MY_API = {
+      add: 'https://cl7amnl6j2.hzh.sealos.run/add-todo',
+      getList: 'https://cl7amnl6j2.hzh.sealos.run/get_list',
+      delete: 'https://cl7amnl6j2.hzh.sealos.run/delete-todo'  // 新增删除接口
+    };
+
+    let lastSyncTime = '从未同步';
+
+    // 添加任务（支持来自服务器/本地，并绑定 _id）
+    async function addTodoItem(text, completed = false, isFromServer = false, id = null) {
+      const li = document.createElement('li');
+      li.className = 'todo-item';
+      if (completed) li.classList.add('completed');
+
+      // 存储服务器返回的 _id
+      li.dataset.id = id;
+
+      const contentSpan = document.createElement('span');
+      contentSpan.textContent = text;
+      contentSpan.className = 'content';
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.textContent = '删除';
+      deleteBtn.className = 'delete-btn';
+
+      // 双击编辑
+      li.addEventListener('dblclick', function(e) {
+        if (e.target === li || e.target === contentSpan) {
+          startEdit(li, contentSpan);
+        }
+      });
+
+      // 单击切换完成状态
+      li.addEventListener('click', function(e) {
+        if (e.target === li || e.target === contentSpan) {
+          li.classList.toggle('completed');
+          saveTodos();
+          syncToServer(); // 同步完成状态
+        }
+      });
+
+      // 删除按钮：同步删除本地 + 服务器
+      deleteBtn.addEventListener('click', async function(e) {
+        e.stopPropagation();
+        const taskId = li.dataset.id;
+        li.remove();
+        saveTodos();
+        updateCount();
+
+        if (taskId) {
+          try {
+            await axios.post(MY_API.delete, { id: taskId });
+            updateSyncStatus(`✅ 已从服务器删除任务`);
+          } catch (err) {
+            console.warn('❌ 删除服务器任务失败', err);
+            updateSyncStatus(`⚠️ 删除本地成功，但服务器删除失败`);
+          }
+        }
+      });
+
+      li.appendChild(contentSpan);
+      li.appendChild(deleteBtn);
+      document.getElementById('todo-list').appendChild(li);
+
+      // 如果是本地新增，才同步到服务器（避免循环）
+      if (!isFromServer && !id) {
+        await addRemoteTodo(text, completed, li);
+      }
+
+      saveTodos();
+      updateCount();
+    }
+
+    // 编辑功能
+    function startEdit(li, contentSpan) {
+      const oldText = contentSpan.textContent;
+      const taskId = li.dataset.id;
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = oldText;
+      input.className = 'edit-input';
+
+      li.replaceChild(input, contentSpan);
+      input.focus();
+      input.select();
+
+      async function saveEdit() {
+        const newText = input.value.trim();
+        if (newText) {
+          contentSpan.textContent = newText;
+          li.replaceChild(contentSpan, input);
+          saveTodos();
+
+          // 如果有 ID，尝试同步更新（Laf 不支持 update，可删+增或忽略）
+          // 这里我们只更新状态，文本不同步到服务器（或可通过新接口）
+          updateSyncStatus(`📝 "${newText}" 已编辑（文本未同步）`);
+        } else {
+          li.replaceChild(contentSpan, input);
+        }
+      }
+
+      input.addEventListener('blur', saveEdit);
+      input.addEventListener('keypress', e => e.key === 'Enter' && saveEdit());
+    }
+
+    // 保存到 localStorage
+    function saveTodos() {
+      const todos = Array.from(document.querySelectorAll('#todo-list .todo-item')).map(li => {
+        return {
+          text: li.querySelector('.content').textContent,
+          completed: li.classList.contains('completed'),
+          id: li.dataset.id || null
+        };
+      });
+      localStorage.setItem('todos', JSON.stringify(todos));
+    }
+
+    // 更新计数
+    function updateCount() {
+      const count = document.querySelectorAll('#todo-list .todo-item').length;
+      document.getElementById('task-count').textContent = count;
+    }
+
+    // 同步：添加任务到服务器，并获取 _id
+    async function addRemoteTodo(text, completed, liElement) {
+      try {
+        const res = await axios.post(MY_API.add, { value: text, isCompleted: completed });
+        const taskId = res.data.id; // 从服务器获取插入的 _id
+
+        if (liElement && taskId) {
+          liElement.dataset.id = taskId; // 绑定 ID
+        }
+
+        lastSyncTime = new Date().toLocaleTimeString();
+        updateSyncStatus(`✅ "${text}" 已同步（ID: ${taskId})`);
+      } catch (err) {
+        console.warn('❌ 同步失败（你的服务器）', err);
+        updateSyncStatus(`❌ "${text}" 同步失败`);
+      }
+    }
+
+    // 从服务器加载所有任务（以服务器为准）
+    async function loadFromMyServer() {
+      try {
+        const res = await axios.get(MY_API.getList);
+        const remoteTodos = res.data.list || [];
+
+        // 清空当前列表（以服务器数据为准）
+        document.getElementById('todo-list').innerHTML = '';
+
+        // 如果服务器为空，自动创建 5 条示例任务
+        if (remoteTodos.length === 0) {
+          const examples = [
+            '学习 JavaScript',
+            '每天运动 30 分钟',
+            '阅读一本书',
+            '写一篇日记',
+            '整理桌面'
+          ];
+
+          try {
+            await Promise.all(
+              examples.map(item =>
+                axios.post(MY_API.add, { value: item, isCompleted: false })
+              )
+            );
+
+            // 重新获取最新数据
+            const newRes = await axios.get(MY_API.getList);
+            const newTodos = newRes.data.list || [];
+            newTodos.forEach(todo => {
+              addTodoItem(todo.value, todo.isCompleted, true, todo._id);
+            });
+
+            updateSyncStatus(`✅ 已自动创建 5 条示例任务并同步`);
+          } catch (err) {
+            console.error('❌ 创建示例任务失败', err);
+            updateSyncStatus(`❌ 示例任务创建失败`);
+          }
+        } else {
+          // 正常渲染服务器数据
+          remoteTodos.forEach(todo => {
+            addTodoItem(todo.value, todo.isCompleted, true, todo._id);
+          });
+          updateSyncStatus(`✅ 已加载 ${remoteTodos.length} 条服务器任务`);
+        }
+
+        saveTodos(); // 同步到本地
+        updateCount();
+        return true;
+
+      } catch (err) {
+        console.warn('❌ 无法连接到你的服务器', err);
+        updateSyncStatus('❌ 无法连接到服务器');
+        return false;
+      }
+    }
+
+    // 页面加载逻辑
+    window.addEventListener('load', async function() {
+      // 1. 恢复本地数据（快速展示）
+      const saved = localStorage.getItem('todos');
+      if (saved) {
+        try {
+          const todos = JSON.parse(saved);
+          todos.forEach(todo => {
+            addTodoItem(todo.text, todo.completed, false, todo.id);
+          });
+          updateCount();
+        } catch (e) {
+          console.error('解析本地数据失败', e);
+          localStorage.removeItem('todos');
+        }
+      }
+
+      // 2. 尝试从服务器加载（覆盖本地，保证一致性）
+      const loaded = await loadFromMyServer();
+      if (!loaded && document.querySelectorAll('#todo-list .todo-item').length === 0) {
+        // 极端兜底（可选）
+        const defaults = ['写日记', '锻炼30分钟', '阅读10页书'];
+        defaults.forEach(task => addTodoItem(task, false, false));
+        updateSyncStatus('💡 使用本地默认任务');
+      }
+    });
+
+    // 添加任务按钮
+    document.getElementById('add-todo-btn').addEventListener('click', async function() {
+      const input = document.getElementById('new-todo');
+      const text = input.value.trim();
+      if (text) {
+        await addTodoItem(text, false, false);
+        input.value = '';
+      }
+    });
+
+    // 回车添加
+    document.getElementById('new-todo').addEventListener('keypress', function(e) {
+      if (e.key === 'Enter') {
+        document.getElementById('add-todo-btn').click();
+      }
+    });
+
+    // 更新同步状态
+    function updateSyncStatus(msg) {
+      document.getElementById('sync-status').textContent = msg;
+    }
+  </script>
+</body>
+</html>
